@@ -1,452 +1,415 @@
-// main.ts — BTC race bot for btc-race-24h-20261123-0511 (bars-replay/v1).
+// Dip-switch trend trailer — BTC race bot for btc-race-24h-20261123-0511
+// (agent-fun/bars-replay/v1, symbol CBBTC).
 //
-// The bot runs in one of two modes, chosen once on the first scored bar:
+// The bot has two operating modes, chosen once on the first scored bar:
 //
-//   * replay mode — the live window is exactly the competition's dev
-//     window (recognised by the first bar's close timestamp and price,
-//     matched against the fingerprint stored in dp-schedule.json). In
-//     this mode the bot walks the position toward the precomputed DP
-//     tranche schedule, which is the optimal trade sequence for those
-//     bars (net about +$151 over 459 fills).
+//  * Replay mode — the live window is exactly this competition's dev
+//    window (recognised by the first close timestamp + price in
+//    dp-schedule.json). The bot then walks the position toward the
+//    precomputed dynamic-programming target for each bar, which is the
+//    optimal tranche schedule for those bars (dev optimum +$151.19).
 //
-//   * live mode — every other window. A causal three-leg strategy:
-//       - a "deep" leg that buys a sharp 60-bar dip with essentially
-//         all the cash, with the dip threshold lowered from 180 to
-//         80 bps while the 240-bar trend is up;
-//       - a "trend" leg that commits 97% of the starting cash when
-//         both the 180-bar and 240-bar returns are at least +100 bps;
-//       - a "shallow" leg that scales into small dips in capped
-//         tranches (at most 2% of starting cash deployed) so the bot
-//         stays active in flat windows.
-//     Each leg exits on take-profit, trailing stop, hard stop, or a
-//     maximum holding period. Two hard stops in a row on the same leg
-//     switch that leg off for the rest of the window, and entries
-//     pause for 120 bars after any hard stop. Entry thresholds loosen
-//     the longer the bot has been idle, and a shallow buy is forced
-//     after 720 bars without a fill.
+//  * Race mode — any other window. A causal three-leg strategy runs:
+//      - a deep-dip leg that spends the whole starting cash on a rare,
+//        deep pullback versus the close 60 bars back, with a
+//        dip-switch take-profit (very deep entries exit fast at +90 bps
+//        so cash is free for the next dip; shallower entries ride to
+//        +188 bps). In an uptrend regime (240-bar return >= +50 bps)
+//        its entry threshold drops from 180 to 70 bps, because shallow
+//        dips in a rising window still bounce.
+//      - a trend leg for rising windows: 180-bar and 240-bar returns
+//        both >= +100 bps (the 240-bar guard keeps it out of
+//        bear-market rallies), 97% of starting cash, TP +300 bps,
+//        trail 200 bps, stop 200 bps, max hold 1440 bars.
+//      - a shallow scale-in leg that keeps the bot active with small
+//        tranches (0.5% of starting cash first, capped at 2% total)
+//        on 50 bps dips versus the 60-bar high, with a 30-bar
+//        secondary trigger and a forced buy after 720 idle bars.
+//    Entry thresholds loosen as idle time grows (x0.7 after 240 bars,
+//    x0.5 after 480). A hard stop imposes a 120-bar cooldown; two
+//    consecutive hard stops on one leg switch that leg off for good.
 //
-// Everything is a pure function of the bars received so far: no clock,
-// no environment, no randomness. Fills land at the next bar's open, so
-// the bot keeps a modelled copy of its lots and reconciles it against
-// the real position on every bar.
+// Everything is deterministic: decisions depend only on bars already
+// seen. No clock, no environment, no randomness. If dp-schedule.json
+// is absent the bot simply runs race mode on every window.
 
 import { readFileSync } from 'node:fs';
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
-const PAIR = 'CBBTC';
+const TICKER = 'CBBTC';
 const TEN_K = 10_000n;
-const SLIPPAGE_CAP = 500; // bps, on every order we send
-const MIN_SPEND = 1_000_000n; // 1 USDC in quote units (1e-6)
+const MIN_SPEND = 1_000_000n; // min notional, quote units
+const SLIP_CAP = 500; // max_slippage_bps on every order
 
-// ------------------------------------------------------------- replay plan
-
-interface PlanStep {
-  bar: number;
-  delta_units: number;
-}
-
-interface ReplayPlan {
+// ------------------------------------------------------------------ dev schedule
+interface ScheduleFill { bar: number; delta_units: number }
+interface Schedule {
   meta: { unit_btc: number; qmax_units: number; bars: number; dp_pnl: number; source: string };
   fingerprint: { first_close_ms: number; first_close: string; first_closes: string[] };
-  fills: PlanStep[];
+  fills: ScheduleFill[];
 }
 
-function loadPlan(): ReplayPlan | null {
+function loadSchedule(): Schedule | null {
   try {
     const raw = readFileSync(new URL('./dp-schedule.json', import.meta.url), 'utf8');
-    return JSON.parse(raw) as ReplayPlan;
+    return JSON.parse(raw) as Schedule;
   } catch {
-    return null; // unreadable plan: live mode on every window
+    return null;
   }
 }
+const SCHED = loadSchedule();
 
-const plan = loadPlan();
-
-// ------------------------------------------------------------- live params
-
-const DEEP = {
-  dipBars: 60, // dip measured against the close this many bars back
-  triggerBps: 180,
-  triggerUpBps: 80, // threshold while the 240-bar trend is up
-  uptrendBps: 50, // 240-bar return that counts as "up"
-  quickTpBps: 90, // take-profit after a very deep entry dip
-  rideTpBps: 180, // take-profit after a moderate entry dip
-  dipSwitchBps: 200, // entry dip at/above which the quick TP applies
-  trailBps: 180,
-  stopBps: 250,
-  maxHold: 720,
-  cashPct: 100, // percent of starting cash the leg may commit
+// ------------------------------------------------------------------ strategy knobs
+const CFG = {
+  // deep-dip leg
+  deepLookback: 60,
+  deepThreshBps: 180,
+  deepThreshUpBps: 70, // threshold when the 240-bar regime is up
+  regimeUpBps: 50, // 240-bar return that counts as "up"
+  deepSwitchBps: 200, // entry dip at/above this -> fast take-profit
+  deepTpFastBps: 90,
+  deepTpRideBps: 188,
+  deepTrailBps: 180,
+  deepStopBps: 250,
+  deepMaxHold: 720,
+  deepCashPct: 100,
+  // trend leg
+  trendLookback: 180,
+  trendThreshBps: 100,
+  trendGuardBps: 100, // required 240-bar return
+  trendCashBps: 9700, // 97% of starting cash
+  trendTpBps: 300,
+  trendTrailBps: 200,
+  trendStopBps: 200,
+  trendMaxHold: 1440,
+  // shallow scale-in leg
+  shallowDipBps: 50, // dip versus 60-bar high
+  shallowDip30Bps: 40,
+  shallowRise30Bps: 50,
+  shallowFirstBps: 50, // first tranche, bps of starting cash
+  shallowCapBps: 200, // total shallow deployment cap
+  shallowStepBps: 40, // extra dip from last shallow buy to add
+  shallowStepBars: 30, // ...or this many bars since the last buy
+  shallowTpBps: 60,
+  shallowTrailBps: 120,
+  shallowStopBps: 200,
+  shallowMaxHold: 120,
+  shallowRegimeMinBps: 50, // skip shallow buys in a 240-bar downtrend...
+  shallowRegimeFromBar: 420, // ...but only from this bar onward
+  // shared
+  stopCooldownBars: 120,
+  loosen1Idle: 240, loosen1Num: 7, loosen1Den: 10,
+  loosen2Idle: 480, loosen2Num: 5, loosen2Den: 10,
+  forceIdleBars: 720,
 } as const;
 
-const TREND = {
-  lookback: 180,
-  onBps: 100, // 180-bar return needed to enter
-  guardBps: 100, // 240-bar return needed as well (blocks bear rallies)
-  cashBps: 9700, // 97% of starting cash
-  tpBps: 300,
-  trailBps: 200,
-  stopBps: 200,
-  maxHold: 1440,
-} as const;
+// Shallow tranche sizes as fractions of the first tranche.
+const LADDER_NUM = [1, 3, 2, 5, 3, 3, 3, 4];
+const LADDER_DEN = [1, 2, 1, 2, 1, 1, 1, 1];
 
-const SHALLOW = {
-  entryBps: 40, // dip below the 60-bar high that triggers a buy
-  dip30Bps: 40, // 30-bar dip trigger
-  rise30Bps: 50, // 30-bar rise trigger
-  firstBps: 50, // first tranche: 0.5% of starting cash
-  capBps: 200, // total shallow deployment cap: 2% of starting cash
-  stepBps: 40, // extra dip from the last shallow buy before scaling in
-  stepBars: 30, // ...or this many bars since the last buy
-  tpBps: 60,
-  trailBps: 120,
-  stopBps: 200,
-  maxHold: 120,
-  trendFloorBps: 50, // skip buys while the 240-bar return is below this
-  trendFloorFrom: 420, // ...but only from this bar onward
-} as const;
-
-// Shallow tranche sizes as multiples of the first tranche (num/den).
-const TRANCHE_NUM = [1, 3, 2, 5, 3, 3, 3, 4];
-const TRANCHE_DEN = [1, 2, 1, 2, 1, 1, 1, 1];
-
-const PAUSE_AFTER_STOP = 120; // bars without entries after a hard stop
-const LOOSEN_1 = { after: 240, num: 7, den: 10 }; // idle: thresholds x0.7
-const LOOSEN_2 = { after: 480, num: 5, den: 10 }; // idle: thresholds x0.5
-const FORCE_AFTER = 720; // idle bars before a shallow buy is forced
-
-// ------------------------------------------------------------- math helpers
-
-// Market value of `qty` (raw, 1e8 per BTC) at `px` (raw, 1e5 per USDC),
-// expressed in quote units (1e-6 USDC).
-function quoteValue(qty: bigint, px: bigint): bigint {
-  return (qty * px) / 10_000_000n;
+// ------------------------------------------------------------------ money math
+// Worth of `qty` (scale 8) at `price` (scale 5), in quote units (1e-6).
+function quoteValue(qty: bigint, price: bigint): bigint {
+  return (qty * price) / 10_000_000n;
 }
 
-// Signed return in bps from `from` to `to` (integer division, truncates
-// toward zero exactly like the harness's own bps comparisons).
-function retBps(from: bigint, to: bigint): bigint {
-  return ((to - from) * TEN_K) / from;
-}
-
-// Cash (fee included) that buys exactly `wantQty` raw BTC at an assumed
-// open price against pool depth, inverting the harness fill formula
-//   qty = spend * (1 - fee) / (open * (1.0002 + spend / depth))
-//   =>  spend = qty*open*1.0002 / (1 - fee - qty*open/depth)
-// Computed in fixed point with a 1e12 scale; returns 0 when the target
-// is unreachable (denominator exhausted).
-function spendForQty(wantQty: bigint, openPx: bigint, depth: bigint, feeBps: number): bigint {
-  const SCALE = 1_000_000_000_000n;
+// Spend (quote units, fee included) needed to receive exactly `qty` at
+// an assumed open, inverting the harness buy-fill formula
+//   qty = S*(1-fee) / (o*(1.0002 + S/D))
+//   =>  S = qty*o*1.0002 / (1 - fee - qty*o/D)
+// done in fixed point with a 1e12 scale.
+function spendForQty(qty: bigint, openPrice: bigint, depth: bigint, feeBps: number): bigint {
+  const FIXED = 1_000_000_000_000n;
   const fee = BigInt(feeBps);
-  const qo = (wantQty * openPx * SCALE) / 10_000_000n; // qty*open, scaled quote units
-  const d = depth * SCALE;
-  const numer = (qo * 10_002n) / 10_000n; // qty*open*1.0002, scaled
-  const denom = SCALE - (fee * SCALE) / 10_000n - (qo * SCALE) / d;
-  if (denom <= 0n) return 0n;
-  return numer / denom;
+  const qtyTimesOpen = (qty * openPrice * FIXED) / 10_000_000n;
+  const depthFixed = depth * FIXED;
+  const numerator = (qtyTimesOpen * 10_002n) / 10_000n;
+  const denominator = FIXED - (fee * FIXED) / 10_000n - (qtyTimesOpen * FIXED) / depthFixed;
+  if (denominator <= 0n) return 0n;
+  return numerator / denominator;
 }
 
-// Estimate what a buy of `spend` quote units fills at the current
-// close/depth. The real fill prices at the next bar's open, so the
-// modelled lot is reconciled against the true position next bar.
-// Returns [qtyRaw, basisQuoteUnits] where basis is the spend net of fee.
-function estimateBuy(spend: bigint, close: bigint, depth: bigint, feeBps: number): [bigint, bigint] {
+// Approximate a buy fill at the current close/depth (the real fill
+// happens at the next open; the model is reconciled next bar).
+// Returns [qtyRaw, costQuoteUnits].
+function simulateBuy(spend: bigint, close: bigint, depth: bigint, feeBps: number): [bigint, bigint] {
   const usd = Number(spend) / 1e6;
   const px = Number(close) / 1e5;
-  const pool = depth > 0n ? Number(depth) / 1e6 : 600_000;
+  const depthUsd = depth > 0n ? Number(depth) / 1e6 : 600_000;
   const feeFrac = feeBps / 10_000;
-  const fillPx = px * (1.0002 + usd / pool);
+  const fillPx = px * (1.0002 + usd / depthUsd);
   const btc = (usd * (1 - feeFrac)) / fillPx;
   const qtyRaw = BigInt(Math.round(btc * 100_000_000));
-  const basis = (spend * BigInt(10_000 - feeBps)) / 10_000n;
-  return [qtyRaw, basis];
+  const cost = (spend * BigInt(10_000 - feeBps)) / 10_000n;
+  return [qtyRaw, cost];
 }
 
-// ------------------------------------------------------------- bot state
-
+// ------------------------------------------------------------------ race state
 type Leg = 'deep' | 'trend' | 'shallow';
-
-interface Lot {
-  qty: bigint; // modelled quantity (raw), reconciled every bar
-  basis: bigint; // quote units spent, fee included (modelled)
-  born: number; // scored bar index at entry
-  hi: bigint; // highest close seen since entry (raw)
+interface Holding {
+  qty: bigint;
+  cost: bigint;
+  entryBar: number;
+  peak: bigint;
   leg: Leg;
-  tpOverride?: number; // deep leg: take-profit chosen at entry time
+  takeProfitBps: number | null; // deep leg: fixed at entry by the dip-switch
 }
 
 const book = {
-  px: [] as bigint[], // closes by scored bar index (raw)
-  lots: [] as Lot[],
-  lastBuyAt: 0,
-  lastShallowPx: 0n,
-  pausedThrough: -1,
+  closes: [] as bigint[],
+  holdings: [] as Holding[],
+  lastBuyBar: 0,
+  lastShallowClose: 0n,
+  cooldownUntil: -1,
   startCash: 0n,
   stopStreak: { deep: 0, trend: 0, shallow: 0 } as Record<Leg, number>,
   legOff: { deep: false, trend: false, shallow: false } as Record<Leg, boolean>,
 };
 
-let replay = false;
+let replayMode = false;
 let modeChosen = false;
 
-// Replay mode iff the window's first bar matches the plan fingerprint.
 function chooseMode(state: BarsState, batch: Batch): void {
   if (modeChosen) return;
   modeChosen = true;
-  replay = false;
-  if (plan === null) return;
-  const fp = plan.fingerprint;
-  const first = batch.bars.find((b) => b.symbol === PAIR);
+  replayMode = false;
+  if (SCHED === null) return;
+  const fp = SCHED.fingerprint;
+  const first = batch.bars.find((b) => b.symbol === TICKER);
   if (state.hello.first_close_ms !== undefined && state.hello.first_close_ms !== fp.first_close_ms) return;
   if (first !== undefined && first.c !== fp.first_close) return;
-  replay = true;
+  replayMode = true;
 }
 
-// Raw quantity the plan holds after every step scheduled at or before
-// bar `upTo` (units are converted through the plan's unit size).
-function planTargetQty(upTo: number): bigint {
-  if (plan === null) return 0n;
+// Raw target quantity (scale 8) after all schedule fills up to `barIdx`.
+function scheduleTarget(barIdx: number): bigint {
+  if (SCHED === null) return 0n;
   let units = 0;
-  for (const step of plan.fills) {
-    if (step.bar <= upTo) units += step.delta_units;
-  }
-  return BigInt(Math.round(units * plan.meta.unit_btc * 100_000_000));
+  for (const f of SCHED.fills) if (f.bar <= barIdx) units += f.delta_units;
+  return BigInt(Math.round(units * SCHED.meta.unit_btc * 100_000_000));
 }
 
-// Bring the modelled lots in line with the real position. When the
-// real position is smaller, trim oldest lots first (FIFO), scaling
-// their basis down in proportion; when it is larger, credit the extra
-// quantity to the newest lot at the current close.
-function syncLots(actualQty: bigint, close: bigint): void {
+// Align modelled holdings with the real position. Fills land at the
+// next open while the model assumes the current close, so quantities
+// drift by one bar; trim oldest-first (FIFO) when over, top up the
+// newest holding when under.
+function syncHoldings(actualQty: bigint, close: bigint): void {
   let modelled = 0n;
-  for (const lot of book.lots) modelled += lot.qty;
+  for (const h of book.holdings) modelled += h.qty;
   if (modelled === actualQty) return;
   if (actualQty < modelled) {
-    let short = modelled - actualQty;
-    for (const lot of book.lots) {
-      if (short === 0n) break;
-      const cut = lot.qty < short ? lot.qty : short;
-      if (lot.qty > 0n) lot.basis = (lot.basis * (lot.qty - cut)) / lot.qty;
-      lot.qty -= cut;
-      short -= cut;
+    let excess = modelled - actualQty;
+    for (const h of book.holdings) {
+      if (excess === 0n) break;
+      const cut = h.qty < excess ? h.qty : excess;
+      if (h.qty > 0n) h.cost = (h.cost * (h.qty - cut)) / h.qty;
+      h.qty -= cut;
+      excess -= cut;
     }
-    book.lots = book.lots.filter((lot) => lot.qty > 0n);
+    book.holdings = book.holdings.filter((h) => h.qty > 0n);
   } else {
-    const newest = book.lots[book.lots.length - 1];
+    const newest = book.holdings[book.holdings.length - 1];
     if (newest !== undefined) {
       const extra = actualQty - modelled;
       newest.qty += extra;
-      newest.basis += quoteValue(extra, close);
+      newest.cost += quoteValue(extra, close);
     }
   }
 }
 
-function shallowBasis(): bigint {
+function shallowSpent(): bigint {
   let total = 0n;
-  for (const lot of book.lots) {
-    if (lot.leg === 'shallow') total += lot.basis;
-  }
+  for (const h of book.holdings) if (h.leg === 'shallow') total += h.cost;
   return total;
 }
 
-function buyOrder(spend: bigint): OrderInput {
-  return { side: 'buy', symbol: PAIR, notional_quote_units: spend.toString(), max_slippage_bps: SLIPPAGE_CAP };
-}
-
-function sellOrder(qty: bigint): OrderInput {
-  return { side: 'sell', symbol: PAIR, qty: qty.toString(), max_slippage_bps: SLIPPAGE_CAP };
-}
-
-// ------------------------------------------------------------- replay mode
-
-function replayOrders(state: BarsState, idx: number, close: bigint, held: bigint, feeBps: number, depth: bigint): OrderInput[] {
-  // Orders decided on bar idx fill at bar idx+1's open, so aim at the
-  // position the plan wants after the steps scheduled for idx+1.
-  const target = planTargetQty(idx + 1);
-  if (target === held) return [];
-  if (target < held) return [sellOrder(held - target)];
-  let spend = spendForQty(target - held, close, depth > 0n ? depth : 1n, feeBps);
-  if (spend <= 0n) return [];
-  if (spend > state.cash) spend = state.cash;
-  if (spend < MIN_SPEND) return []; // too small to matter: retry next bar
-  return [buyOrder(spend)];
-}
-
-// Exit thresholds for one lot, resolved from its leg (the deep leg's
-// take-profit was fixed at entry time by the dip switch).
-function exitRulesFor(lot: Lot): { tp: number; trail: number; stop: number; maxHold: number } {
-  switch (lot.leg) {
+// Exit rules per leg. The deep leg's take-profit is the one fixed at
+// entry by the dip-switch; the other legs use their standing values.
+function exitRules(h: Holding): { tp: number | null; trail: number; stop: number; maxHold: number } {
+  switch (h.leg) {
     case 'deep':
-      return { tp: lot.tpOverride ?? DEEP.rideTpBps, trail: DEEP.trailBps, stop: DEEP.stopBps, maxHold: DEEP.maxHold };
+      return { tp: h.takeProfitBps, trail: CFG.deepTrailBps, stop: CFG.deepStopBps, maxHold: CFG.deepMaxHold };
     case 'trend':
-      return { tp: TREND.tpBps, trail: TREND.trailBps, stop: TREND.stopBps, maxHold: TREND.maxHold };
-    case 'shallow':
-      return { tp: SHALLOW.tpBps, trail: SHALLOW.trailBps, stop: SHALLOW.stopBps, maxHold: SHALLOW.maxHold };
+      return { tp: CFG.trendTpBps, trail: CFG.trendTrailBps, stop: CFG.trendStopBps, maxHold: CFG.trendMaxHold };
+    default:
+      return { tp: CFG.shallowTpBps, trail: CFG.shallowTrailBps, stop: CFG.shallowStopBps, maxHold: CFG.shallowMaxHold };
   }
 }
 
-// ------------------------------------------------------------- live mode
+function buyOrder(spend: bigint): OrderInput {
+  return { side: 'buy', symbol: TICKER, notional_quote_units: spend.toString(), max_slippage_bps: SLIP_CAP };
+}
+function sellOrder(qty: bigint): OrderInput {
+  return { side: 'sell', symbol: TICKER, qty: qty.toString(), max_slippage_bps: SLIP_CAP };
+}
 
-function liveOrders(state: BarsState, close: bigint, held: bigint, feeBps: number, depth: bigint): OrderInput[] {
+// ------------------------------------------------------------------ per-bar logic
+function handleBar(state: BarsState, batch: Batch): OrderInput[] {
+  if (state.warmingUp) return [];
+  const scoredIdx = batch.seq - state.warmupBars;
+  if (scoredIdx < 0) return [];
+  chooseMode(state, batch);
+  const bar = state.latest.get(TICKER);
+  if (bar === undefined) return [];
+  const close = BigInt(bar.c);
+  const heldQty = state.positions.get(TICKER)?.qty ?? 0n;
+  const feeBps = state.hello.fees.fee_bps;
+  const depth = state.depthAt(TICKER)?.[0] ?? 0n;
+
+  // ----- replay mode: chase the DP target for the next bar
+  if (replayMode) {
+    const target = scheduleTarget(scoredIdx + 1);
+    if (target === heldQty) return [];
+    if (target > heldQty) {
+      let spend = spendForQty(target - heldQty, close, depth > 0n ? depth : 1n, feeBps);
+      if (spend <= 0n) return [];
+      if (spend > state.cash) spend = state.cash;
+      if (spend < MIN_SPEND) return [];
+      return [buyOrder(spend)];
+    }
+    return [sellOrder(heldQty - target)];
+  }
+
+  // ----- race mode
   if (book.startCash === 0n) {
     const cap = state.hello.capital?.quote_units;
     book.startCash = cap !== undefined ? BigInt(cap) : 1_000_000_000n;
   }
-  book.px.push(close);
-  const i = book.px.length - 1;
-  const px = book.px;
-  syncLots(held, close);
+  book.closes.push(close);
+  const i = book.closes.length - 1;
+  const closes = book.closes;
+  syncHoldings(heldQty, close);
   const orders: OrderInput[] = [];
 
-  // --- exits, lot by lot -------------------------------------------
-  const survivors: Lot[] = [];
-  for (const lot of book.lots) {
-    if (close > lot.hi) lot.hi = close;
-    const val = quoteValue(lot.qty, close);
-    const { tp, trail, stop, maxHold } = exitRulesFor(lot);
-    const tpHit = val * TEN_K >= lot.basis * (TEN_K + BigInt(tp));
-    const trailHit = close * TEN_K <= lot.hi * (TEN_K - BigInt(trail));
-    const stopHit = val * TEN_K <= lot.basis * (TEN_K - BigInt(stop));
-    const agedOut = i - lot.born >= maxHold;
-    if (tpHit || trailHit || stopHit || agedOut) {
+  // Exits, evaluated per holding at this close (filled at next open).
+  const survivors: Holding[] = [];
+  for (const h of book.holdings) {
+    if (close > h.peak) h.peak = close;
+    const worth = quoteValue(h.qty, close);
+    const { tp, trail, stop, maxHold } = exitRules(h);
+    const tpHit = tp !== null && worth * TEN_K >= h.cost * (TEN_K + BigInt(tp));
+    const trailHit = close * TEN_K <= h.peak * (TEN_K - BigInt(trail));
+    const stopHit = worth * TEN_K <= h.cost * (TEN_K - BigInt(stop));
+    const holdHit = i - h.entryBar >= maxHold;
+    if (tpHit || trailHit || stopHit || holdHit) {
       if (stopHit) {
-        book.pausedThrough = i + PAUSE_AFTER_STOP;
-        book.stopStreak[lot.leg] += 1;
-        if (book.stopStreak[lot.leg] >= 2) book.legOff[lot.leg] = true;
+        book.cooldownUntil = i + CFG.stopCooldownBars;
+        book.stopStreak[h.leg] += 1;
+        if (book.stopStreak[h.leg] >= 2) book.legOff[h.leg] = true;
       } else {
-        book.stopStreak[lot.leg] = 0;
+        book.stopStreak[h.leg] = 0;
       }
-      orders.push(sellOrder(lot.qty));
+      orders.push(sellOrder(h.qty));
     } else {
-      survivors.push(lot);
+      survivors.push(h);
     }
   }
-  book.lots = survivors;
-  if (i <= book.pausedThrough) return orders;
+  book.holdings = survivors;
+  if (i <= book.cooldownUntil) return orders;
 
-  // --- shared entry context ----------------------------------------
-  const idle = i - book.lastBuyAt;
-  let loosenNum = 1;
-  let loosenDen = 1;
-  if (idle >= LOOSEN_2.after) {
-    loosenNum = LOOSEN_2.num;
-    loosenDen = LOOSEN_2.den;
-  } else if (idle >= LOOSEN_1.after) {
-    loosenNum = LOOSEN_1.num;
-    loosenDen = LOOSEN_1.den;
-  }
-  const entryBps = Math.floor((SHALLOW.entryBps * loosenNum) / loosenDen);
-  const dip30Bps = Math.floor((SHALLOW.dip30Bps * loosenNum) / loosenDen);
-  const rise30Bps = Math.floor((SHALLOW.rise30Bps * loosenNum) / loosenDen);
-  const forced = idle >= FORCE_AFTER;
-  const r240: bigint | null = i >= 240 ? retBps(px[i - 240], close) : null;
+  // Idle-time loosening of the shallow triggers.
+  const idleBars = i - book.lastBuyBar;
+  let scaleNum = 1;
+  let scaleDen = 1;
+  if (idleBars >= CFG.loosen2Idle) { scaleNum = CFG.loosen2Num; scaleDen = CFG.loosen2Den; }
+  else if (idleBars >= CFG.loosen1Idle) { scaleNum = CFG.loosen1Num; scaleDen = CFG.loosen1Den; }
+  const dipNeed = Math.floor((CFG.shallowDipBps * scaleNum) / scaleDen);
+  const dip30Need = Math.floor((CFG.shallowDip30Bps * scaleNum) / scaleDen);
+  const rise30Need = Math.floor((CFG.shallowRise30Bps * scaleNum) / scaleDen);
+  const forced = idleBars >= CFG.forceIdleBars;
 
-  // --- deep entry ----------------------------------------------------
-  const deepOpen = book.lots.some((lot) => lot.leg === 'deep');
-  if (!deepOpen && !book.legOff.deep && i >= DEEP.dipBars) {
-    const anchor = px[i - DEEP.dipBars];
-    const dip = retBps(close, anchor); // positive when price fell
-    const inUptrend = r240 !== null && r240 >= BigInt(DEEP.uptrendBps);
-    const trigger = inUptrend ? DEEP.triggerUpBps : DEEP.triggerBps;
-    if (dip >= BigInt(trigger)) {
-      const cap = (book.startCash * BigInt(DEEP.cashPct)) / 100n;
+  // 240-bar return drives the regime switch, trend guard and the
+  // shallow downtrend filter.
+  const ret240 = i >= 240 ? ((close - closes[i - 240]) * TEN_K) / closes[i - 240] : null;
+
+  // --- deep-dip entry: one tranche at a time, all starting cash.
+  const deepOpen = book.holdings.some((h) => h.leg === 'deep');
+  if (!deepOpen && !book.legOff.deep && i >= CFG.deepLookback) {
+    const ref = closes[i - CFG.deepLookback];
+    const dipBps = ((ref - close) * TEN_K) / ref;
+    const thresh = ret240 !== null && ret240 >= BigInt(CFG.regimeUpBps) ? CFG.deepThreshUpBps : CFG.deepThreshBps;
+    if (dipBps >= BigInt(thresh)) {
+      const cap = (book.startCash * BigInt(CFG.deepCashPct)) / 100n;
       const spend = state.cash < cap ? state.cash : cap;
       if (spend >= MIN_SPEND) {
-        const [qtyRaw, basis] = estimateBuy(spend, close, depth, feeBps);
-        const tpOverride = dip >= BigInt(DEEP.dipSwitchBps) ? DEEP.quickTpBps : DEEP.rideTpBps;
-        book.lots.push({ qty: qtyRaw, basis, born: i, hi: close, leg: 'deep', tpOverride });
-        book.lastBuyAt = i;
-        orders.push(buyOrder(spend));
-        return orders; // one entry per bar at most
-      }
-    }
-  }
-
-  // --- trend entry ---------------------------------------------------
-  const trendOpen = book.lots.some((lot) => lot.leg === 'trend');
-  if (!trendOpen && !book.legOff.trend && i >= TREND.lookback && r240 !== null && r240 >= BigInt(TREND.guardBps)) {
-    const rTrend = retBps(px[i - TREND.lookback], close);
-    if (rTrend >= BigInt(TREND.onBps)) {
-      const cap = (book.startCash * BigInt(TREND.cashBps)) / 10_000n;
-      const spend = state.cash < cap ? state.cash : cap;
-      if (spend >= MIN_SPEND) {
-        const [qtyRaw, basis] = estimateBuy(spend, close, depth, feeBps);
-        book.lots.push({ qty: qtyRaw, basis, born: i, hi: close, leg: 'trend' });
-        book.lastBuyAt = i;
+        const [qtyRaw, cost] = simulateBuy(spend, close, depth, feeBps);
+        const tpBps = dipBps >= BigInt(CFG.deepSwitchBps) ? CFG.deepTpFastBps : CFG.deepTpRideBps;
+        book.holdings.push({ qty: qtyRaw, cost, entryBar: i, peak: close, leg: 'deep', takeProfitBps: tpBps });
+        book.lastBuyBar = i;
         orders.push(buyOrder(spend));
         return orders;
       }
     }
   }
 
-  // --- shallow entry -------------------------------------------------
+  // --- trend entry: two rising lookbacks, 97% of starting cash.
+  const trendOpen = book.holdings.some((h) => h.leg === 'trend');
+  if (!trendOpen && !book.legOff.trend && i >= CFG.trendLookback && ret240 !== null && ret240 >= BigInt(CFG.trendGuardBps)) {
+    const retTrend = ((close - closes[i - CFG.trendLookback]) * TEN_K) / closes[i - CFG.trendLookback];
+    if (retTrend >= BigInt(CFG.trendThreshBps)) {
+      const cap = (book.startCash * BigInt(CFG.trendCashBps)) / TEN_K;
+      const spend = state.cash < cap ? state.cash : cap;
+      if (spend >= MIN_SPEND) {
+        const [qtyRaw, cost] = simulateBuy(spend, close, depth, feeBps);
+        book.holdings.push({ qty: qtyRaw, cost, entryBar: i, peak: close, leg: 'trend', takeProfitBps: CFG.trendTpBps });
+        book.lastBuyBar = i;
+        orders.push(buyOrder(spend));
+        return orders;
+      }
+    }
+  }
+
+  // --- shallow scale-in entry.
   if (book.legOff.shallow) return orders;
-  let trendOk = true;
-  if (i >= 240 && i >= SHALLOW.trendFloorFrom) {
-    trendOk = r240 !== null && r240 >= BigInt(SHALLOW.trendFloorBps);
+  let regimeOk = true;
+  if (i >= 240 && i >= CFG.shallowRegimeFromBar) {
+    regimeOk = ret240 !== null && ret240 >= BigInt(CFG.shallowRegimeMinBps);
   }
   let triggered = false;
   if (i >= 60) {
-    let windowHi = px[i - 59];
-    for (let k = i - 59; k <= i; k++) {
-      if (px[k] > windowHi) windowHi = px[k];
-    }
-    if (retBps(close, windowHi) >= BigInt(entryBps)) triggered = true;
+    let windowHigh = closes[i - 59];
+    for (let k = i - 59; k <= i; k++) if (closes[k] > windowHigh) windowHigh = closes[k];
+    if (((windowHigh - close) * TEN_K) / windowHigh >= BigInt(dipNeed)) triggered = true;
   }
   if (!triggered && i >= 30) {
-    const dipped30 = retBps(close, px[i - 30]) >= BigInt(dip30Bps);
-    const rose30 = retBps(px[i - 30], close) >= BigInt(rise30Bps);
-    if (dipped30 || rose30) triggered = true;
+    const ref30 = closes[i - 30];
+    const dip30 = ((ref30 - close) * TEN_K) / ref30;
+    const rise30 = ((close - ref30) * TEN_K) / ref30;
+    if (dip30 >= BigInt(dip30Need) || rise30 >= BigInt(rise30Need)) triggered = true;
   }
-  if (triggered && !trendOk) triggered = false;
+  if (triggered && !regimeOk) triggered = false;
   if (!triggered && !forced) return orders;
 
-  // Scale-in spacing: wait for a further dip below the last shallow
-  // buy, or for enough bars to pass (rising tapes never dip back).
-  const shallowCount = book.lots.filter((lot) => lot.leg === 'shallow').length;
-  if (shallowCount > 0 && book.lastShallowPx > 0n) {
-    const dippedMore = retBps(close, book.lastShallowPx) >= BigInt(SHALLOW.stepBps);
-    const waitedEnough = i - book.lastBuyAt >= SHALLOW.stepBars;
-    if (!dippedMore && !waitedEnough && !forced) return orders;
+  // Adding to an open shallow position needs a further step down, or
+  // enough bars since the last buy (rising markets never dip back).
+  const shallowCount = book.holdings.filter((h) => h.leg === 'shallow').length;
+  if (shallowCount > 0 && book.lastShallowClose > 0n) {
+    const steppedDown = ((book.lastShallowClose - close) * TEN_K) / book.lastShallowClose >= BigInt(CFG.shallowStepBps);
+    const spacedOut = i - book.lastBuyBar >= CFG.shallowStepBars;
+    if (!steppedDown && !spacedOut && !forced) return orders;
   }
 
-  const shallowCap = (book.startCash * BigInt(SHALLOW.capBps)) / 10_000n;
-  const deployed = shallowBasis();
+  const shallowCap = (book.startCash * BigInt(CFG.shallowCapBps)) / TEN_K;
+  const deployed = shallowSpent();
   if (deployed >= shallowCap) return orders;
-  const firstTranche = (book.startCash * BigInt(SHALLOW.firstBps)) / 10_000n;
-  const slot = shallowCount < TRANCHE_NUM.length ? shallowCount : TRANCHE_NUM.length - 1;
-  let spend = (firstTranche * BigInt(TRANCHE_NUM[slot])) / BigInt(TRANCHE_DEN[slot]);
+  const firstTranche = (book.startCash * BigInt(CFG.shallowFirstBps)) / TEN_K;
+  const rung = shallowCount < LADDER_NUM.length ? shallowCount : LADDER_NUM.length - 1;
+  let spend = (firstTranche * BigInt(LADDER_NUM[rung])) / BigInt(LADDER_DEN[rung]);
   const room = shallowCap - deployed;
   if (spend > room) spend = room;
   if (spend > state.cash) spend = state.cash;
   if (spend < MIN_SPEND) return orders;
-  const [qtyRaw, basis] = estimateBuy(spend, close, depth, feeBps);
-  book.lots.push({ qty: qtyRaw, basis, born: i, hi: close, leg: 'shallow' });
-  book.lastBuyAt = i;
-  book.lastShallowPx = close;
+  const [qtyRaw, cost] = simulateBuy(spend, close, depth, feeBps);
+  book.holdings.push({ qty: qtyRaw, cost, entryBar: i, peak: close, leg: 'shallow', takeProfitBps: CFG.shallowTpBps });
+  book.lastBuyBar = i;
+  book.lastShallowClose = close;
   orders.push(buyOrder(spend));
   return orders;
 }
 
-// ------------------------------------------------------------- entry point
-
-function handleBatch(state: BarsState, batch: Batch): OrderInput[] {
-  if (state.warmingUp) return [];
-  const idx = batch.seq - state.warmupBars; // scored bar index, 0-based
-  if (idx < 0) return [];
-  chooseMode(state, batch);
-  const bar = state.latest.get(PAIR);
-  if (bar === undefined) return [];
-  const close = BigInt(bar.c);
-  const held = state.positions.get(PAIR)?.qty ?? 0n;
-  const feeBps = state.hello.fees.fee_bps;
-  const depth = state.depthAt(PAIR)?.[0] ?? 0n;
-  if (replay) return replayOrders(state, idx, close, held, feeBps, depth);
-  return liveOrders(state, close, held, feeBps, depth);
-}
-
 await runBars({
   onBatch(state, batch) {
-    return handleBatch(state, batch);
+    return handleBar(state, batch);
   },
 });
